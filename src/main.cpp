@@ -1,3 +1,10 @@
+#include <algorithm>
+#include <cctype>
+
+#ifdef QT_VERSION_CHECK
+#include <QStringConverter>
+#endif
+    
 #include <QApplication>
 #include <QMainWindow>
 #include <QVBoxLayout>
@@ -18,6 +25,9 @@
 #include <QRegularExpression>
 #include "SSHClient.h"
 #include "ThreadPool.h"
+#include <thread>
+#include <mutex>
+#include <algorithm>
 
 #ifdef USE_QXLSX
 #include "xlsxdocument.h"
@@ -25,6 +35,30 @@
     
 // Глобальные переменные для синхронизации и хранения данных
 QMutex fileMutex; 
+
+// Global normalizeLine function
+std::string normalizeLine(const std::string& line) {
+    std::string result = line;
+    result.erase(std::remove(result.begin(), result.end(), '\r'), result.end());
+    
+    size_t start = result.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return "";
+    }
+    
+    size_t end = result.find_last_not_of(" \t");
+    return result.substr(start, end - start + 1);
+}
+
+// src/main.cpp
+
+void recording(const std::string &filePath, const std::string &ip, const std::string &status) {
+    std::ofstream outfile(filePath, std::ios::app);
+    if (outfile.is_open()) {
+        // Явно используем \n для совместимости
+        outfile << ip << " - " << status << "\n";
+    }
+}
 
 // Функция пинга с анализом вывода
 bool ping_host(const std::string &address) {
@@ -36,62 +70,25 @@ bool ping_host(const std::string &address) {
         << "-w" << "2000" 
         << QString::fromStdString(address));
 #else
+    // Linux: -q (quiet mode), -c 1 (один пакет), -W 3 (таймаут 3 сек)
     pingProcess.start("ping", QStringList() 
+        << "-q" 
         << "-c" << "1" 
-        << "-W" << "2" 
+        << "-W" << "3" 
         << QString::fromStdString(address));
 #endif
 
-    if (!pingProcess.waitForFinished(3500)) {
+    // Увеличим общий таймаут ожидания процесса
+    if (!pingProcess.waitForFinished(5000)) {
         pingProcess.kill();
         return false;
     }
 
     int exitCode = pingProcess.exitCode();
-    QByteArray output = pingProcess.readAllStandardOutput();
-    QString strOutput = QString::fromUtf8(output);
-
-#ifdef Q_OS_WIN
-    if (strOutput.contains("TTL=") || strOutput.contains("Reply from")) {
-        return true;
-    }
-#else
-    if (strOutput.contains("1 received") || strOutput.contains("1 packets received")) {
-        return true;
-    }
-#endif
-
-    if (exitCode == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-// Функция записи результатов в файл
-void recording(const std::string &path_file, const std::string &name, const std::string &reason) {
-    QMutexLocker locker(&fileMutex);
     
-    std::set<std::string> existingNames;
-    std::ifstream infile(path_file);
-    std::string existingName;
-    std::string line = name + " " + reason;
-
-    if (infile.is_open()) {
-        while (std::getline(infile, existingName)) {
-            existingNames.insert(existingName);
-        }
-        infile.close();
-    }
-
-    if (existingNames.find(line) == existingNames.end()) {
-        std::ofstream file(path_file, std::ios::app);
-        if (file.is_open()) {
-            file << name << " " << reason << std::endl;
-        } else {
-            std::cerr << "Не удалось открыть файл для записи: " << path_file << std::endl;
-        }
-    }
+    // ping возвращает 0 если хост доступен, != 0 если недоступен
+    // Это работает одинаково в Windows и Linux
+    return (exitCode == 0);
 }
 
 // Функция записи firewall правил в файл на роутере
@@ -132,11 +129,35 @@ bool write_firewall_rules(SSHClient &client, const QString &firewallFilePath) {
         client.executeCommand(cmd);
     }
     
-    
     std::string finalCmd = "sh -c '. /etc/firewall.user; reboot &'";
     
     int rc = client.executeCommand(finalCmd);
     return (rc == SSH_OK);
+}
+
+// Служебные функции чтения строк из файла
+std::vector<std::string> readLinesFromFile(const QString &filePath) {
+    std::vector<std::string> lines;
+    QFile file(filePath);
+    
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&file);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        in.setEncoding(QStringConverter::Utf8);
+#else
+        in.setCodec("UTF-8");
+#endif
+        
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            if (!line.isEmpty()) {
+                lines.push_back(line.toStdString());
+            }
+        }
+        file.close();
+    }
+    
+    return lines;
 }
 
 class MainWindow : public QMainWindow {
@@ -205,11 +226,15 @@ public:
         setWindowTitle("Настройка Firewall на роутерах");
         resize(550, 450);
 
-        pool = new ThreadPool(4);
+        // Ограничение до 50% ядер
+        unsigned int hardwareThreads = std::thread::hardware_concurrency();
+        unsigned int poolSize = std::max(1u, hardwareThreads / 2);
+        pool = std::make_unique<ThreadPool>(poolSize);
+     //   log(QString("Пул потоков: %1 из %2 ядер").arg(poolSize).arg(hardwareThreads));
     }
 
     ~MainWindow() {
-        delete pool;
+        // unique_ptr handles deletion
     }
 
 private slots:
@@ -286,8 +311,11 @@ private slots:
         std::string line;
         
         while (std::getline(infile, line)) {
+            // Нормализуем строку перед обработкой
+            std::string normalized = normalizeLine(line);
+            
             QRegularExpression ipRegex("(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})");
-            QRegularExpressionMatch match = ipRegex.match(QString::fromStdString(line));
+            QRegularExpressionMatch match = ipRegex.match(QString::fromStdString(normalized));
             if (match.hasMatch()) {
                 addresses.push_back(match.captured(1).toStdString());
             }
@@ -364,7 +392,6 @@ private slots:
                             log(QString("Проход %1: %2 - firewall записан").arg(passNumber).arg(QString::fromStdString(ip)));
                             client.disconnect();
                             
-                           
                         } else {
                             log(QString("Проход %1: %2 - ошибка записи firewall").arg(passNumber).arg(QString::fromStdString(ip)));
                             client.disconnect();
@@ -405,17 +432,32 @@ private slots:
             return;
 #endif
         } else {
-            std::ifstream ifsIP(addrPath.toStdString());
-            std::string line;
-            while (std::getline(ifsIP, line)) {
-                if (!line.empty()) ips.push_back(line);
+            // Используем Qt для чтения (автоматически обрабатывает CRLF)
+            QFile file(addrPath);
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QTextStream in(&file);
+                while (!in.atEnd()) {
+                    QString line = in.readLine().trimmed();
+                    if (!line.isEmpty()) {
+                        ips.push_back(line.toStdString());
+                    }
+                }
+                file.close();
             }
+            log(QString("Прочитано %1 IP из файла").arg(ips.size()));
         }
 
-        std::ifstream ifsPass(PathListPassword->text().toStdString());
-        std::string line;
-        while (std::getline(ifsPass, line)) {
-            if (!line.empty()) passwords.push_back(line);
+        // Чтение паролей с обработкой CRLF
+        QFile passFile(PathListPassword->text());
+        if (passFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&passFile);
+            while (!in.atEnd()) {
+                QString line = in.readLine().trimmed();
+                if (!line.isEmpty()) {
+                    passwords.push_back(line.toStdString());
+                }
+            }
+            passFile.close();
         }
 
         std::reverse(passwords.begin(), passwords.end());
@@ -429,9 +471,10 @@ private slots:
             return;
         }
 
+        auto passwordsCopy = passwords;
         for (const auto& ip : ips) {
-            pool->enqueue([this, ip, passwords]() {
-                processIP(ip, passwords);
+            pool->enqueue([this, ip, passwordsCopy]() {
+                processIP(ip, passwordsCopy);
             });
         }
     }
@@ -444,7 +487,7 @@ private slots:
     QPushButton *btnStart;
     QTextEdit *logArea;
     QLabel *progres;
-    ThreadPool *pool;
+    std::unique_ptr<ThreadPool> pool;
 
     QString PathAddresses;
     QString PathPasswords;
@@ -514,16 +557,33 @@ private slots:
 
     void checkFinish() {
         if (completedTasks == totalTasks) {
-            QMetaObject::invokeMethod(this, [this]() {
+            // Запускаем повторные проходы в фоновом потоке, не блокируя UI
+            std::thread([this]() {
                 log("Основной список завершён. Начинаю проходы по журналу...");
                 
                 retryFailedAddresses(1);
                 retryFailedAddresses(2);
                 
-                btnStart->setEnabled(true);
-                log("Завершено.");
-            });
+                QMetaObject::invokeMethod(this, [this]() {
+                    btnStart->setEnabled(true);
+                    log("Завершено.");
+                });
+            }).detach();
         }
+    }
+
+    // New function to initialize thread pool based on hardware concurrency
+    void initThreadPool() {
+        // Получаем количество аппаратных потоков
+        unsigned int hardwareThreads = std::thread::hardware_concurrency();
+        
+        // Ограничиваем до 50% (минимум 1 поток)
+        unsigned int poolSize = std::max(1u, hardwareThreads / 2);
+        
+        // Создаём пул с ограниченным размером
+        pool = std::make_unique<ThreadPool>(poolSize);
+        
+    //    log(QString("Пул потоков: %1 из %2 ядер").arg(poolSize).arg(hardwareThreads));
     }
 };
 
@@ -535,3 +595,25 @@ int main(int argc, char *argv[]) {
 }
 
 #include "main.moc"
+
+// src/main.cpp
+
+std::vector<std::string> readIPsFromFile(const QString &filePath) {
+    std::vector<std::string> ips;
+    QFile file(filePath);
+    
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return ips;
+    }
+    
+    QTextStream in(&file);
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (!line.isEmpty()) {
+            ips.push_back(line.toStdString());
+        }
+    }
+    
+    file.close();
+    return ips;
+}
